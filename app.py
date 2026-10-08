@@ -261,6 +261,229 @@ def decrypt_pdf_to_temp(uploaded_file, password: str):
             pass
         raise
 
+
+# -------------------------------------------------------------------
+# v1.8 대용량 자료 자동 분할 분석
+# -------------------------------------------------------------------
+
+CHUNK_CHAR_LIMIT = 36000
+MERGE_CHAR_LIMIT = 65000
+
+EXTRACTION_PROMPT = r"""
+당신의 역할은 보험 고지 질문서 분석을 위한 '의료기록 사실 추출기'입니다.
+아래에는 심평원 진료정보 PDF에서 추출한 일부 페이지 텍스트가 들어옵니다.
+
+목표:
+최종 질문서 1~6 판정에 필요한 사실만 빠짐없이, 최대한 압축해서 추출하세요.
+
+반드시 남길 것:
+- 진료/검사/처방/입원/수술/치료의 날짜
+- 의료기관명
+- 진단/상병명과 코드
+- 입원 여부와 입원 일수
+- 수술/시술명이 문서에 명시되어 있으면 정확한 명칭
+- 동일 원인으로 7일 이상 계속 치료 여부를 판단할 수 있는 날짜/치료일수
+- 약품 상품명, 성분명, 처방일, 처방일수
+- 검사 및 이상소견
+- '이상소견 때문에 추가검사/재검사를 시행했다'는 인과관계가 문서에 명시된 경우 그 연결
+- 암/백혈병/고혈압/협심증/심근경색/심장판막증/간경화증/뇌졸중/당뇨병/AIDS·HIV/직장·항문질환 관련 직접 기재
+- 원문 출처: [파일명 p.페이지]
+
+규칙:
+1. 문서에 없는 내용을 추정하지 마세요.
+2. 약물만 보고 질병을 진단하지 마세요.
+3. 단순 검사를 확정진단으로 바꾸지 마세요.
+4. 중복으로 보이는 기록도 이 단계에서는 누락하지 말고 남기세요. 최종 단계에서 통합합니다.
+5. 보험 가입 가능 여부나 인수 판단을 하지 마세요.
+6. 긴 설명은 금지합니다. 가능한 한 한 사건을 한 줄로 압축하세요.
+7. 해당 페이지에 질문서와 관련 있는 의료 사실이 전혀 없다면 '관련 기록 없음'만 출력하세요.
+
+권장 형식:
+[파일명 p.N] YYYY-MM-DD | 의료기관 | 진단/상병(코드) | 의료행위/검사/수술/입원 | 약물(상품명/성분명, 처방일수) | 비고
+
+페이지 텍스트:
+"""
+
+MERGE_PROMPT = r"""
+당신은 여러 의료기록 추출 결과를 합치는 정리기입니다.
+
+아래 추출 결과들을 하나의 '압축 병력 원장'으로 통합하세요.
+
+규칙:
+- 사실을 삭제하거나 새로 추정하지 마세요.
+- 동일 날짜·동일 의료기관·동일 사건의 명백한 중복만 합치세요.
+- 서로 다른 수술/입원/처방/검사는 따로 남기세요.
+- 상품명과 성분명이 함께 있으면 상품명(성분명) 형태를 유지하세요.
+- 날짜, 처방일수, 입원일수, 수술명, 진단명/코드, 이상소견→추가검사 연결은 반드시 보존하세요.
+- 각 사건의 [파일명 p.N] 출처를 반드시 보존하세요.
+- 설명문을 줄이고 한 사건 한 줄 중심으로 최대한 압축하세요.
+- 보험 인수 판단은 하지 마세요.
+
+통합할 추출 결과:
+"""
+
+def extract_pdf_pages(pdf_path: str, display_name: str):
+    """복호화된 PDF에서 페이지별 텍스트를 추출합니다."""
+    reader = PdfReader(pdf_path)
+    pages = []
+    for idx, page in enumerate(reader.pages, start=1):
+        try:
+            text = page.extract_text() or ""
+        except Exception:
+            text = ""
+        text = re.sub(r"\x00", "", text)
+        text = text.strip()
+        if text:
+            pages.append((display_name, idx, text))
+    return pages
+
+def make_text_chunks(page_records, limit=CHUNK_CHAR_LIMIT):
+    """
+    페이지 경계를 최대한 유지하면서 문자 수 기준으로 청크를 생성합니다.
+    매우 긴 한 페이지는 안전하게 분할합니다.
+    """
+    chunks = []
+    current = []
+    current_len = 0
+
+    for filename, page_no, text in page_records:
+        prefix = f"\n\n### [파일: {filename} / p.{page_no}]\n"
+        block = prefix + text
+
+        # 한 페이지 자체가 한도를 넘는 경우 분할
+        if len(block) > limit:
+            if current:
+                chunks.append("".join(current))
+                current = []
+                current_len = 0
+
+            room = max(5000, limit - len(prefix) - 80)
+            start = 0
+            part = 1
+            while start < len(text):
+                piece = text[start:start + room]
+                chunks.append(
+                    f"\n\n### [파일: {filename} / p.{page_no} / part {part}]\n{piece}"
+                )
+                start += room
+                part += 1
+            continue
+
+        if current and current_len + len(block) > limit:
+            chunks.append("".join(current))
+            current = []
+            current_len = 0
+
+        current.append(block)
+        current_len += len(block)
+
+    if current:
+        chunks.append("".join(current))
+
+    return chunks
+
+def call_text_response(client, model, developer_text, user_text, max_output_tokens=6000):
+    response = client.responses.create(
+        model=model,
+        max_output_tokens=max_output_tokens,
+        input=[
+            {
+                "role": "developer",
+                "content": [{"type": "input_text", "text": developer_text}],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": user_text}],
+            },
+        ],
+    )
+    return response.output_text.strip()
+
+def merge_summaries(client, model, summaries, progress_callback=None):
+    """
+    중간 추출 결과가 최종 모델 입력 한도를 넘지 않도록
+    필요한 만큼 계층적으로 압축합니다.
+    """
+    current = [s for s in summaries if s and "관련 기록 없음" not in s.strip()]
+
+    if not current:
+        return "질문서 관련 의료기록이 자료에서 확인되지 않음."
+
+    round_no = 0
+    while sum(len(x) for x in current) > MERGE_CHAR_LIMIT or len(current) > 12:
+        round_no += 1
+        new_current = []
+        batch = []
+        batch_len = 0
+
+        for item in current:
+            # 배치가 너무 커지기 전에 끊기
+            if batch and (batch_len + len(item) > 48000 or len(batch) >= 8):
+                merged = call_text_response(
+                    client,
+                    model,
+                    "의료기록 통합 단계입니다. 원문 사실과 출처를 보존하면서 중복만 제거하고 압축하세요.",
+                    MERGE_PROMPT + "\n\n" + "\n\n".join(batch),
+                    max_output_tokens=7000,
+                )
+                new_current.append(merged)
+                if progress_callback:
+                    progress_callback()
+                batch = []
+                batch_len = 0
+
+            batch.append(item)
+            batch_len += len(item)
+
+        if batch:
+            merged = call_text_response(
+                client,
+                model,
+                "의료기록 통합 단계입니다. 원문 사실과 출처를 보존하면서 중복만 제거하고 압축하세요.",
+                MERGE_PROMPT + "\n\n" + "\n\n".join(batch),
+                max_output_tokens=7000,
+            )
+            new_current.append(merged)
+            if progress_callback:
+                progress_callback()
+
+        # 혹시 모델이 압축을 충분히 하지 못했더라도 무한루프 방지
+        if len(new_current) >= len(current) and sum(len(x) for x in new_current) >= sum(len(x) for x in current):
+            current = new_current
+            break
+
+        current = new_current
+
+        if round_no >= 5:
+            break
+
+    combined = "\n\n".join(current)
+
+    # 최종 입력이 여전히 큰 경우 마지막 압축 1회
+    if len(combined) > MERGE_CHAR_LIMIT:
+        groups = []
+        start = 0
+        while start < len(combined):
+            groups.append(combined[start:start + 45000])
+            start += 45000
+
+        compacted = []
+        for g in groups:
+            compacted.append(
+                call_text_response(
+                    client,
+                    model,
+                    "의료기록 최종 압축 단계입니다. 날짜·진단·입원·수술·치료일수·약물·처방일수·검사 연결·출처를 절대 누락하지 마세요.",
+                    MERGE_PROMPT + "\n\n" + g,
+                    max_output_tokens=7000,
+                )
+            )
+            if progress_callback:
+                progress_callback()
+        combined = "\n\n".join(compacted)
+
+    return combined
+
 def strip_markdown(text):
     text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
     text = re.sub(r"`(.*?)`", r"\1", text)
@@ -732,7 +955,7 @@ uploaded_files = st.file_uploader(
     accept_multiple_files=True,
 )
 
-st.info("비밀번호가 설정된 PDF도 그대로 첨부할 수 있습니다. 원본 파일은 변경되지 않습니다.")
+st.info("비밀번호가 설정된 PDF도 그대로 첨부할 수 있습니다. 병력이 많은 대용량 자료는 자동으로 나누어 분석합니다. 원본 파일은 변경되지 않습니다.")
 
 if uploaded_files:
     st.write(f"첨부된 PDF: **{len(uploaded_files)}개**")
@@ -751,62 +974,115 @@ if analyze:
         st.stop()
 
     client = OpenAI(api_key=api_key)
-    created_file_ids = []
     temp_paths = []
 
     try:
-        with st.spinner("PDF를 확인하고 병력을 분석하고 있습니다..."):
-            content = [{
-                "type": "input_text",
-                "text": (
-                    f"청약/분석 기준일은 {analysis_date.isoformat()} 입니다.\n"
-                    "첨부된 모든 PDF를 서로 대조해서 중복을 제거하고, "
-                    "기본 고지 질문서 1~6번 기준으로만 간결하게 분석해 주세요."
-                ),
-            }]
+        status_box = st.empty()
+        progress = st.progress(0, text="PDF를 확인하고 있습니다...")
 
-            decrypt_errors = []
+        # 1단계: 복호화 + 로컬 텍스트 추출
+        all_pages = []
+        decrypt_errors = []
 
-            for uf in uploaded_files:
-                try:
-                    src_path, decrypted_path = decrypt_pdf_to_temp(uf, pdf_password)
-                    temp_paths.extend([src_path, decrypted_path])
-                except Exception as e:
-                    decrypt_errors.append(f"{uf.name}: {e}")
-                    continue
+        for idx, uf in enumerate(uploaded_files, start=1):
+            status_box.info(f"PDF 확인 중... ({idx}/{len(uploaded_files)})")
+            try:
+                src_path, decrypted_path = decrypt_pdf_to_temp(uf, pdf_password)
+                temp_paths.extend([src_path, decrypted_path])
+                pages = extract_pdf_pages(decrypted_path, uf.name)
+                all_pages.extend(pages)
+            except Exception as e:
+                decrypt_errors.append(f"{uf.name}: {e}")
 
-                with open(decrypted_path, "rb") as fh:
-                    uploaded = client.files.create(
-                        file=(uf.name, fh, "application/pdf"),
-                        purpose="user_data",
-                        expires_after={"anchor": "created_at", "seconds": 3600},
-                    )
-                created_file_ids.append(uploaded.id)
-                content.append({"type": "input_file", "file_id": uploaded.id})
-
-            if decrypt_errors:
-                st.error("일부 PDF를 열지 못했습니다.")
-                for msg in decrypt_errors:
-                    st.write(f"- {msg}")
-
-            if not created_file_ids:
-                st.stop()
-
-            response = client.responses.create(
-                model=model,
-                input=[
-                    {
-                        "role": "developer",
-                        "content": [{"type": "input_text", "text": SYSTEM_PROMPT}],
-                    },
-                    {
-                        "role": "user",
-                        "content": content,
-                    },
-                ],
+            progress.progress(
+                min(15, int(idx / max(1, len(uploaded_files)) * 15)),
+                text="PDF를 확인하고 있습니다..."
             )
 
-            result = response.output_text
+        if decrypt_errors:
+            st.error("일부 PDF를 열거나 읽지 못했습니다.")
+            for msg in decrypt_errors:
+                st.write(f"- {msg}")
+
+        if not all_pages:
+            st.error(
+                "PDF에서 분석 가능한 텍스트를 추출하지 못했습니다. "
+                "스캔 이미지형 PDF이거나 지원되지 않는 문서일 수 있습니다."
+            )
+            st.stop()
+
+        # 2단계: 자료가 길어도 안전하도록 자동 분할
+        chunks = make_text_chunks(all_pages)
+        total_chars = sum(len(c) for c in chunks)
+
+        if len(chunks) > 1:
+            status_box.info(
+                f"자료량이 많아 {len(chunks)}개 구간으로 자동 분할했습니다. "
+                "각 구간에서 병력을 먼저 추출한 뒤 최종 질문서 판정을 진행합니다."
+            )
+        else:
+            status_box.info("병력 정보를 추출하고 있습니다...")
+
+        # 3단계: 청크별 사실 추출
+        summaries = []
+        for i, chunk in enumerate(chunks, start=1):
+            status_box.info(f"병력 추출 중... ({i}/{len(chunks)})")
+            summary = call_text_response(
+                client,
+                model,
+                "보험 고지 분석용 의료기록 사실 추출 단계입니다. 추정 없이 원문 사실과 출처만 압축해서 보존하세요.",
+                EXTRACTION_PROMPT + "\n\n" + chunk,
+                max_output_tokens=6000,
+            )
+            summaries.append(summary)
+            pct = 15 + int((i / max(1, len(chunks))) * 50)
+            progress.progress(min(65, pct), text=f"병력 추출 중... ({i}/{len(chunks)})")
+
+        # 4단계: 중간 결과가 많은 경우 계층적으로 통합
+        merge_calls = 0
+        def on_merge():
+            nonlocal_dummy = None  # callback scope placeholder
+
+        status_box.info("중복 기록을 정리하고 있습니다...")
+
+        merged_progress_count = [0]
+        def merge_progress():
+            merged_progress_count[0] += 1
+            pct = min(82, 66 + merged_progress_count[0] * 3)
+            progress.progress(pct, text="중복 기록을 정리하고 있습니다...")
+
+        consolidated = merge_summaries(
+            client,
+            model,
+            summaries,
+            progress_callback=merge_progress,
+        )
+
+        # 5단계: 질문서 1~6 최종 판정
+        status_box.info("기본 고지 질문서 1~6번을 최종 판정하고 있습니다...")
+        progress.progress(86, text="질문서 기준으로 최종 판정 중...")
+
+        final_user_text = (
+            f"청약/분석 기준일은 {analysis_date.isoformat()} 입니다.\n"
+            f"분석한 원본 PDF 파일 수는 {len(uploaded_files)}개입니다.\n"
+            "아래 내용은 원본 PDF를 여러 구간으로 나누어 추출·통합한 '압축 병력 원장'입니다.\n"
+            "각 [파일명 p.N] 출처를 근거로 동일 진료의 중복을 제거하고, "
+            "기본 고지 질문서 1~6번 기준으로 최종 결과를 작성해 주세요.\n\n"
+            "=== 압축 병력 원장 시작 ===\n"
+            f"{consolidated}\n"
+            "=== 압축 병력 원장 끝 ==="
+        )
+
+        result = call_text_response(
+            client,
+            model,
+            SYSTEM_PROMPT,
+            final_user_text,
+            max_output_tokens=12000,
+        )
+
+        progress.progress(93, text="결과 파일을 만들고 있습니다...")
+        status_box.info("결과 파일을 만들고 있습니다...")
 
         st.success("병력 분석이 완료되었습니다.")
         st.markdown(result)
@@ -814,6 +1090,9 @@ if analyze:
         txt_bytes = result.encode("utf-8-sig")
         pdf_bytes = make_pdf_bytes(result, analysis_date.isoformat())
         xlsx_bytes = make_excel_bytes(result, analysis_date.isoformat())
+
+        progress.progress(100, text="완료")
+        status_box.empty()
 
         st.markdown("### 결과 저장")
         col1, col2, col3 = st.columns(3)
@@ -850,12 +1129,6 @@ if analyze:
         st.exception(e)
 
     finally:
-        for fid in created_file_ids:
-            try:
-                client.files.delete(fid)
-            except Exception:
-                pass
-
         for p in temp_paths:
             try:
                 os.remove(p)
