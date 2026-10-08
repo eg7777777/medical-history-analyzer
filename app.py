@@ -111,6 +111,9 @@ SYSTEM_PROMPT = r"""
 
 [질문 4 한눈에 보기 요약 규칙]
 - 질문 4가 '예'이면서 동시에 확인이 필요한 항목이 있다면, 핵심 근거에 반드시 둘 다 표시한다.
+- 수술 개수를 셀 때는 '종'이 아니라 실제 기록 건수 기준으로 '건'이라고 쓴다.
+- 수술이 4건 이하이면 가능하면 괄호 안에 수술명을 간단히 함께 쓴다.
+- 예: '입원 2건, 수술 3건(근농양배농술·절개술·충수절제술), 7일 이상 치료 1건'
 - 예: '수술 2건, 30일 이상 투약 확인 / 화상 7일 이상 치료 여부 확인 필요'
 - 확정된 내용만 쓰고 확인 필요 항목을 요약에서 누락하지 않는다.
 
@@ -219,6 +222,7 @@ G. 근거 없는 '확인 필요' 남발을 금지한다.
 
 [출력 스타일]
 - 팀원이 보험 고지 확인용으로 빠르게 볼 수 있게 간결하게 작성한다.
+- 수술 개수 표현은 항상 '수술 n건'으로 통일하고 '수술 n종'이라고 쓰지 않는다.
 - 장황한 의학 설명은 하지 않는다.
 - 전체 병력 타임라인은 기본 출력에서 제외한다.
 - 질문 1~6과 직접 관계없는 병력은 나열하지 않는다.
@@ -508,6 +512,20 @@ def make_pdf_bytes(result_text, analysis_date):
 
         if not any(x.strip() for x in filtered):
             continue
+
+        # 추가 확인 항목이 '없음'뿐이면 PDF에서는 섹션 자체를 생략해
+        # 빈 3페이지가 생기지 않도록 한다.
+        if "추가 확인이 필요한 항목" in title:
+            meaningful = []
+            for raw in filtered:
+                t = strip_markdown(raw).strip()
+                if not t:
+                    continue
+                t = re.sub(r"^[\-•*]\s*", "", t).strip()
+                t = re.sub(r"^\d+[\.)]\s*", "", t).strip()
+                meaningful.append(t)
+            if meaningful and all(t in {"없음", "없음.", "해당 없음", "해당 없음."} for t in meaningful):
+                continue
 
         story.append(Paragraph(strip_markdown(title), h_style))
         i = 0
