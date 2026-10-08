@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: medical-history-analyzer
+    runtime: docker
+    plan: free
+    autoDeploy: true
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: APP_PASSWORD
+        sync: false
+      - key: OPENAI_MODEL
+        value: gpt-6-sol
